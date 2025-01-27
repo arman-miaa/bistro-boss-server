@@ -4,7 +4,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-
+const axios = require("axios");
 const formData = require("form-data");
 const Mailgun = require("mailgun.js");
 const mailgun = new Mailgun(formData);
@@ -19,10 +19,17 @@ const port = process.env.PORT || 5000;
 // middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded());
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.7argw.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
+
+
+
+/**
+ * step-1: payment initiate
+ */
 
 
 
@@ -283,91 +290,212 @@ async function run() {
         })
         .then((msg) => console.log(msg)) // logs response data
         .catch((err) => console.log(err)); // logs any error
-       res.send({ paymentResult, deleteResult });
+      res.send({ paymentResult, deleteResult });
+    });
 
-      // state or analytice
-      app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
-        const users = await userCollection.estimatedDocumentCount();
-        const menuItems = await menuCollection.estimatedDocumentCount();
-        const orders = await paymentCollection.estimatedDocumentCount();
 
-        // this is not the best way
-        // const payments = await paymentCollection.find().toArray();
-        // const revenue = payments.reduce((total, pament) => total + pament.price, 0);
+    // SSLCOMMERZ  Payment getway
 
-        const result = await paymentCollection
-          .aggregate([
-            {
-              $group: {
-                _id: null,
-                totalRevenue: {
-                  $sum: "$price",
-                },
-              },
-            },
-          ])
-          .toArray();
+    app.post("/create-ssl-payment", async (req, res) => {
+      const payment = req.body;
+      console.log("payment info", payment);
 
-        const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+      // Generate a unique transaction ID
+      const trxid = new ObjectId().toString();
+      // console.log("Generated trxid:", trxid);
+      payment.transactionId = trxid;
 
-        res.send({
-          users,
-          menuItems,
-          orders,
-          revenue,
-        });
+      // Correct this line:
+      // Use the dynamically generated transaction ID
+
+      //step 1: initialize the data
+      const initiate = {
+        store_id: "arman67964ad769fdd",
+        store_passwd: "arman67964ad769fdd@ssl",
+        total_amount: payment.price,
+        currency: "BDT",
+        tran_id: trxid, // use unique tran_id for each api call
+        success_url: "http://localhost:5000/success-payment",
+        fail_url: "http://localhost:5173/fail",
+        cancel_url: "http://localhost:5173/cancel",
+        ipn_url: "http://localhost:5000/ipn-success-payment",
+        shipping_method: "Courier",
+        product_name: "Computer.",
+        product_category: "Electronic",
+        product_profile: "general",
+        cus_name: "Customer Name",
+        cus_email: `${payment.email}`,
+        cus_add1: "Dhaka",
+        cus_add2: "Dhaka",
+        cus_city: "Dhaka",
+        cus_state: "Dhaka",
+        cus_postcode: "1000",
+        cus_country: "Bangladesh",
+        cus_phone: "01711111111",
+        cus_fax: "01711111111",
+        ship_name: "Customer Name",
+        ship_add1: "Dhaka",
+        ship_add2: "Dhaka",
+        ship_city: "Dhaka",
+        ship_state: "Dhaka",
+        ship_postcode: 1000,
+        ship_country: "Bangladesh",
+      };
+      //step 2: send the request to sslcommerz payment gateway
+      const iniResponse = await axios({
+        url: "https://sandbox.sslcommerz.com/gwprocess/v4/api.php",
+        method: "POST",
+        data: initiate,
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
       });
 
-      // order status
-      /**
-       * --------------------
-       *    NON-Efficient Way
-       * ---------------------
-       * 1. load all the payments
-       * 2. for every menuItemIds (which is an array), go find the item  from menu collection
-       * 3. for every item in the menu collection that you found from a payment entry (document)
-       */
+      const saveData = await paymentCollection.insertOne(payment);
 
-      // using aggregate pipline
-      app.get("/order-stats", verifyToken, verifyAdmin, async (req, res) => {
-        const result = await paymentCollection
-          .aggregate([
-            {
-              $unwind: "$menuItemIds",
-            },
-            {
-              $lookup: {
-                from: "menu",
-                localField: "menuItemIds",
-                foreignField: "_id",
-                as: "menuItems",
-              },
-            },
-            {
-              $unwind: "$menuItems",
-            },
-            {
-              $group: {
-                _id: "$menuItems.category",
-                quantity: { $sum: 1 },
-                revenue: { $sum: "$menuItems.price" },
-              },
-            },
-            {
-              $project: {
-                _id: 0,
-                category: "$_id",
-                quantity: "$quantity",
-                revenue: "$revenue",
-              },
-            },
-          ])
-          .toArray();
+      //step-3 : get the url for payment
+      const gatewayUrl = iniResponse?.data?.GatewayPageURL;
+      //  console.log("gatewayUrl", gatewayUrl);
 
-        res.send(result);
-      });
+      //step-4: redirect the customer to the gateway
+      res.send({ gatewayUrl });
+    });
+
+
+    app.post("/success-payment", async (req, res) => {
+      //step-5 : success payment data
+      const paymentSuccess = req.body;
+      // console.log("payment paymentSuccess info", paymentSuccess);
+
+      //step-6: Validation
+      const { data } = await axios.get(
+        `https://sandbox.sslcommerz.com/validator/api/validationserverAPI.php?val_id=${paymentSuccess.val_id}&store_id=arman67964ad769fdd&store_passwd=arman67964ad769fdd@ssl&format=json`
+      );
+
       
-    })} finally {
+      if (data.status !== "VALID") {
+        return res.send({ message: "Invalid payment" });
+      }
+
+      // console.log("Received tran_id:", data.tran_id);
+      //  console.log("Stored transactionId:", payment.transactionId);
+
+      //step-7: update the payment to your database
+      const updatePayment = await paymentCollection.updateOne(
+        { transactionId: data.tran_id },
+        {
+          $set: {
+            status: "success",
+          },
+        }
+      );
+      // console.log(data.tran_id,'id');
+      // console.log('updatePayment',updatePayment, 'isvalidpayment',data);
+
+      //step-8: find the payment for more functionality
+      const payment = await paymentCollection.findOne({
+        transactionId: data.tran_id,
+      });
+      const query = {
+        _id: {
+          $in: payment.cartIds.map((id) => new ObjectId(id)),
+        },
+      };
+
+      //step:9:delete the cart data
+      const deleteResult = await cartCollection.deleteMany(query);
+
+      // console.log("deleteResult", deleteResult);
+
+      //step-10: redirect the customer to success page
+      res.redirect("http://localhost:5173/success");
+      // console.log(updatePayment, "updatePayment");
+      // console.log("isValidPayment", data);
+    });
+
+
+    // state or analytice
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      // this is not the best way
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce((total, pament) => total + pament.price, 0);
+
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: "$price",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+      res.send({
+        users,
+        menuItems,
+        orders,
+        revenue,
+      });
+    });
+
+    // order status
+    /**
+     * --------------------
+     *    NON-Efficient Way
+     * ---------------------
+     * 1. load all the payments
+     * 2. for every menuItemIds (which is an array), go find the item  from menu collection
+     * 3. for every item in the menu collection that you found from a payment entry (document)
+     */
+
+    // using aggregate pipline
+    app.get("/order-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $unwind: "$menuItemIds",
+          },
+          {
+            $lookup: {
+              from: "menu",
+              localField: "menuItemIds",
+              foreignField: "_id",
+              as: "menuItems",
+            },
+          },
+          {
+            $unwind: "$menuItems",
+          },
+          {
+            $group: {
+              _id: "$menuItems.category",
+              quantity: { $sum: 1 },
+              revenue: { $sum: "$menuItems.price" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              category: "$_id",
+              quantity: "$quantity",
+              revenue: "$revenue",
+            },
+          },
+        ])
+        .toArray();
+
+      res.send(result);
+    });
+  } finally {
       // Ensures that the client will close when you finish/error
       // await client.close();
     }
